@@ -12,7 +12,7 @@ B+E *close* it; Lane A removes the controllable latency that erodes it. All five
 | Lane | File | Owner | Needs | Status |
 |---|---|---|---|---|
 | A — SDK latency & C++ hot path | `AGENT_A_SDK_LATENCY.md` | **manual agent + human** | Ubuntu laptop, robot, remote | not started |
-| B — Motion quality (de-glitch **+ feasibility**) | `AGENT_B_MOTION_QUALITY.md` | Claude agent | this repo (CPU) | **de-glitch DONE (merged `16f6aa7`)**; Phase-2 feasibility TODO |
+| B — Airborne / contact-loss guard | `AGENT_B_AIRBORNE_CONTACT_GUARD.md` | Codex + human validator | code/tests here; G1 for final gate | **SOFTWARE COMPLETE; hardware validation UNFINISHED** |
 | C — Frontend dashboard revamp | `AGENT_C_FRONTEND_UI.md` | manual agent | Node, `ui/server.py` | **reviewed SAFE-TO-MERGE** (branch `frontend/show-mode-preview-revamp`) |
 | **D — Policy-in-the-loop sim sandbox** (the "honest preview") | `AGENT_D_SIM_SANDBOX.md` | Claude agent | laptop (CPU + onnxruntime) | **NEW — flagship** |
 | **E — Fidelity retrain** (track subtle moves, right latency DR) | `AGENT_E_FIDELITY_RETRAIN.md` | manual agent + human | Ubuntu + GPU box | **NEW** |
@@ -38,5 +38,7 @@ retrain FAILED** (`data/telemetry/latency_retrain_20260710/`) — Lane E has the
 ## Lane file boundaries
 
 - **A**: `pipeline/deploy_runtime.py` (instrumentation only), `tools/measure_*`, new `deploy/cpp/` — plus docs.
-- **B**: `pipeline/prep_motion.py`, `pipeline/retarget_gvhmr.py`, `pipeline/vet_motion.py`, new `tools/motion_quality.py` — plus tests.
+- **B**: `pipeline/deploy_runtime.py`, `tools/airborne_guard_replay.py`,
+  `data/telemetry/airborne_guard_20260713/`, Agent-B docs, and tests. Robot commands remain
+  human-only; the branch contains software + offline evidence, not hardware sign-off.
 - **C**: `ui/` only (server.py changes limited to static-file serving), new `ui/frontend/`.

@@ -1,0 +1,98 @@
+{
+  "schema": "airborne-contact-guard-replay/v1",
+  "thresholds": {
+    "divergence_mps": 2.25,
+    "both_speed_mps": 0.6,
+    "confirm_ticks": 12
+  },
+  "corpus": {
+    "files": 10,
+    "ticks": 15588,
+    "candidate_ticks": 94,
+    "max_candidate_run_ticks": 7,
+    "would_trip_files": []
+  },
+  "runs": [
+    {
+      "file": "data/telemetry/20260706-095023_ground-run-legodom.npz",
+      "ticks": 250,
+      "candidate_ticks": 4,
+      "max_candidate_run_ticks": 2,
+      "divergence_mps": {"p95": 2.0145, "p99": 3.0414, "max": 3.397},
+      "both_speed_mps": {"p95": 0.5709, "p99": 0.7847, "max": 1.1713}
+    },
+    {
+      "file": "data/telemetry/20260706-095534_ground-run-legodom.npz",
+      "ticks": 607,
+      "candidate_ticks": 4,
+      "max_candidate_run_ticks": 2,
+      "divergence_mps": {"p95": 0.9408, "p99": 2.4298, "max": 3.7054},
+      "both_speed_mps": {"p95": 0.3959, "p99": 0.6146, "max": 1.0932}
+    },
+    {
+      "file": "data/telemetry/20260706-095920_ground-run-legodom.npz",
+      "ticks": 750,
+      "candidate_ticks": 5,
+      "max_candidate_run_ticks": 2,
+      "divergence_mps": {"p95": 1.0899, "p99": 2.5321, "max": 3.2657},
+      "both_speed_mps": {"p95": 0.4155, "p99": 0.7595, "max": 1.706}
+    },
+    {
+      "file": "data/telemetry/20260706-113411_ground-run-legodom.npz",
+      "ticks": 815,
+      "candidate_ticks": 2,
+      "max_candidate_run_ticks": 2,
+      "divergence_mps": {"p95": 0.9442, "p99": 2.5533, "max": 2.8639},
+      "both_speed_mps": {"p95": 0.3844, "p99": 0.5962, "max": 1.0071}
+    },
+    {
+      "file": "data/telemetry/20260706-114256_ground-run-legodom.npz",
+      "ticks": 1500,
+      "candidate_ticks": 18,
+      "max_candidate_run_ticks": 5,
+      "divergence_mps": {"p95": 1.4749, "p99": 2.6077, "max": 6.1448},
+      "both_speed_mps": {"p95": 0.4856, "p99": 0.8289, "max": 2.3345}
+    },
+    {
+      "file": "data/telemetry/20260706-114445_ground-run-legodom.npz",
+      "ticks": 2589,
+      "candidate_ticks": 21,
+      "max_candidate_run_ticks": 5,
+      "divergence_mps": {"p95": 1.426, "p99": 2.6299, "max": 4.1709},
+      "both_speed_mps": {"p95": 0.4921, "p99": 0.795, "max": 1.4248}
+    },
+    {
+      "file": "data/telemetry/20260706-115004_ground-run-legodom.npz",
+      "ticks": 2589,
+      "candidate_ticks": 21,
+      "max_candidate_run_ticks": 7,
+      "divergence_mps": {"p95": 1.3884, "p99": 2.6597, "max": 3.9137},
+      "both_speed_mps": {"p95": 0.4633, "p99": 0.7151, "max": 1.6286}
+    },
+    {
+      "file": "data/telemetry/20260706-115456_ground-run-legodom.npz",
+      "ticks": 2589,
+      "candidate_ticks": 13,
+      "max_candidate_run_ticks": 5,
+      "divergence_mps": {"p95": 1.3306, "p99": 2.3261, "max": 4.2554},
+      "both_speed_mps": {"p95": 0.397, "p99": 0.6878, "max": 1.5952}
+    },
+    {
+      "file": "data/telemetry/20260706-133246_ground-run-legodom.npz",
+      "ticks": 1310,
+      "candidate_ticks": 0,
+      "max_candidate_run_ticks": 0,
+      "divergence_mps": {"p95": 0.7452, "p99": 1.3484, "max": 2.7832},
+      "both_speed_mps": {"p95": 0.3013, "p99": 0.4517, "max": 0.7614}
+    },
+    {
+      "file": "data/telemetry/20260706-133905_ground-run-legodom.npz",
+      "ticks": 2589,
+      "candidate_ticks": 6,
+      "max_candidate_run_ticks": 4,
+      "divergence_mps": {"p95": 1.2661, "p99": 2.1676, "max": 3.3933},
+      "both_speed_mps": {"p95": 0.3974, "p99": 0.5625, "max": 1.6117}
+    }
+  ],
+  "scope": "Offline false-positive replay only. It does not prove suspended-robot detection; that remains a supervised gantry test."
+}

@@ -196,6 +196,8 @@ def _drive_legodom(monkeypatch, *, exit_mode, abort=False, spy_stand=True,
     monkeypatch.setattr(dr, "read_state",
                         lambda *a, **k: (meta.default.copy(), np.zeros(29),
                                          np.array([1.0, 0, 0, 0]), np.zeros(3), _FakeMsg()))
+    monkeypatch.setattr(dr, "_check_feet_planted",
+                        lambda *a, **k: {"mode": "test", "clear": True})
     monkeypatch.setattr(dr, "_release_motion_service", lambda *a, **k: None)
     monkeypatch.setattr(dr, "_lowcmd_setup", lambda *a, **k: (None, None, None))
     monkeypatch.setattr(dr, "_install_damp_on_signals", lambda *a, **k: None)
@@ -412,6 +414,9 @@ def test_entry_handoff_prearms_before_release_and_catches_current_pose(monkeypat
     monkeypatch.setattr(dr, "read_state",
                         lambda *a, **k: (q0.copy(), np.zeros(29), np.array([1.0, 0, 0, 0]),
                                          np.zeros(3), _FakeMsg()))
+    monkeypatch.setattr(dr, "_check_feet_planted",
+                        lambda *a, **k: (events.append("contact_check") or
+                                         {"mode": "test", "clear": True}))
     monkeypatch.setattr(dr, "ENTRY_CATCH_S", 0.4)
     monkeypatch.setattr(dr, "_lowcmd_setup",
                         lambda *a, **k: (events.append("setup") or (None, None, None)))
@@ -436,6 +441,7 @@ def test_entry_handoff_prearms_before_release_and_catches_current_pose(monkeypat
         dr.mode_ground_run_legodom(meta, object(), ref, "iface", True, 0.05, "damp")
 
     # pre-arm: our controller + safety spine are up BEFORE the onboard release
+    assert events.index("contact_check") < events.index("release")
     assert events.index("setup") < events.index("release")
     assert events.index("signals") < events.index("release")
     # entry catch: a hold AFTER release and BEFORE the ramp to the ready pose

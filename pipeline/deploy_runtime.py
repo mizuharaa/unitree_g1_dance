@@ -205,6 +205,37 @@ START_UPRIGHT_MIN = float(os.environ.get("START_UPRIGHT_MIN", "0.85"))
 # entry, where the move-to-default can tip. e.g. START_POSE_MAX_DELTA_RAD=0.35.
 START_POSE_MAX_DELTA_RAD = float(os.environ.get("START_POSE_MAX_DELTA_RAD", "0"))
 
+# AIRBORNE / CONTACT-LOSS GUARD. The G1 `unitree_hg` LowState used here has no foot-force
+# samples, so passive kinematics CANNOT prove that a perfectly still robot is weight-bearing:
+# a motionless robot hanging from the gantry can produce the same q/dq/IMU readings as one
+# standing on the floor. This guard therefore has two deliberately separate, conservative
+# layers:
+#   * pre-release: sample both legs while onboard balance still owns the robot and report
+#     obvious motion/contact inconsistency. Default ADVISORY; `enforce` is only for supervised
+#     gantry validation and refuses before `_release_motion_service`.
+#   * in-loop: if BOTH feet imply substantial base motion AND the two implied base velocities
+#     disagree for a debounced interval, treat that as contact-confidence collapse. The fault
+#     uses the existing exception -> damping -> onboard handoff path. Default OFF until the
+#     suspended-vs-grounded hardware validation in tasks/AGENT_B_AIRBORNE_CONTACT_GUARD.md.
+#
+# A single lifted foot during a normal step is intentionally not enough: the slower/stance
+# foot must ALSO exceed AIRBORNE_BOTH_SPEED_MPS. All thresholds are environment-overridable
+# so the gantry validation can tune them without changing code.
+AIRBORNE_START_GUARD = os.environ.get("AIRBORNE_START_GUARD", "advisory").strip().lower()
+AIRBORNE_START_SAMPLES = max(1, int(os.environ.get("AIRBORNE_START_SAMPLES", "10")))
+AIRBORNE_START_DIVERGENCE_MPS = float(os.environ.get(
+    "AIRBORNE_START_DIVERGENCE_MPS", "0.75"))
+AIRBORNE_START_BOTH_SPEED_MPS = float(os.environ.get(
+    "AIRBORNE_START_BOTH_SPEED_MPS", "0.20"))
+AIRBORNE_TRIP = os.environ.get("AIRBORNE_TRIP", "0") == "1"
+# Defaults were replayed over 15,588 ticks from 10 recorded real ground runs: 94 candidate
+# ticks, longest consecutive run 7. A 12-tick confirm therefore never false-trips that corpus
+# while retaining a 240 ms response to sustained gross contact loss. Hardware suspended-run
+# validation is still required before AIRBORNE_TRIP becomes a default.
+AIRBORNE_DIVERGENCE_MPS = float(os.environ.get("AIRBORNE_DIVERGENCE_MPS", "2.25"))
+AIRBORNE_BOTH_SPEED_MPS = float(os.environ.get("AIRBORNE_BOTH_SPEED_MPS", "0.60"))
+AIRBORNE_CONFIRM_TICKS = max(2, int(os.environ.get("AIRBORNE_CONFIRM_TICKS", "12")))
+
 # obs term order + widths (mjlab tracking, sums to 160) — authoritative layout.
 OBS_LAYOUT = [
     ("command", 58), ("motion_anchor_pos_b", 3), ("motion_anchor_ori_b", 6),
@@ -1104,6 +1135,141 @@ def _check_start_near_default(q0, meta):
             f"(nothing was released).")
 
 
+def _foot_contact_metrics(leg_info):
+    """Return conservative kinematic contact metrics from LegOdometry `info`.
+
+    `per_foot_v[i]` is the body velocity implied by assuming foot i is planted. If both
+    feet are truly supporting a normal stance, the estimates should be finite and broadly
+    agree. The metrics are evidence of inconsistency only; they are NOT a force/contact
+    measurement and cannot distinguish a perfectly still hanging robot from a still stance.
+    """
+    try:
+        per_foot = np.asarray(leg_info["per_foot_v"], dtype=float)
+        if per_foot.shape != (2, 3) or not np.all(np.isfinite(per_foot)):
+            raise ValueError("expected two finite 3-D per-foot velocities")
+        speeds = np.linalg.norm(per_foot, axis=1)
+        return {
+            "valid": True,
+            "divergence_mps": float(np.linalg.norm(per_foot[0] - per_foot[1])),
+            "min_speed_mps": float(speeds.min()),
+            "max_speed_mps": float(speeds.max()),
+        }
+    except (KeyError, TypeError, ValueError, IndexError):
+        # If enforcement is explicitly enabled, unavailable/non-finite evidence must fail
+        # closed after the same debounce rather than silently disabling the safety layer.
+        return {"valid": False, "divergence_mps": 1.0e9,
+                "min_speed_mps": 1.0e9, "max_speed_mps": 1.0e9}
+
+
+def _airborne_contact_signal(leg_info, divergence_mps=None, both_speed_mps=None):
+    """Return (candidate, reason, metrics) for one tick; no debounce or side effects.
+
+    Requiring BOTH a large left/right disagreement and meaningful motion at the slower foot
+    suppresses the expected one-foot-lift signature of an ordinary step.
+    """
+    div_limit = (AIRBORNE_DIVERGENCE_MPS if divergence_mps is None
+                 else float(divergence_mps))
+    speed_limit = (AIRBORNE_BOTH_SPEED_MPS if both_speed_mps is None
+                   else float(both_speed_mps))
+    metrics = _foot_contact_metrics(leg_info)
+    candidate = (not metrics["valid"] or
+                 (metrics["divergence_mps"] >= div_limit and
+                  metrics["min_speed_mps"] >= speed_limit))
+    if not metrics["valid"]:
+        reason = "per-foot kinematic contact evidence is unavailable/non-finite"
+    else:
+        reason = (f"per-foot base-velocity disagreement {metrics['divergence_mps']:.2f} m/s "
+                  f">= {div_limit:.2f}, with both feet implying >= "
+                  f"{metrics['min_speed_mps']:.2f} m/s (limit {speed_limit:.2f})")
+    return candidate, reason, metrics
+
+
+def _check_airborne_contact(run_ticks, leg_info, tick, enforce=None):
+    """Debounce the in-loop contact-loss heuristic and optionally raise into damping.
+
+    Candidate counters are maintained even in advisory mode so telemetry can establish safe
+    thresholds on real dances. Only AIRBORNE_TRIP=1 (or enforce=True in a test) can raise.
+    """
+    candidate, reason, metrics = _airborne_contact_signal(leg_info)
+    run_ticks = run_ticks + 1 if candidate else 0
+    enabled = AIRBORNE_TRIP if enforce is None else bool(enforce)
+    if enabled and run_ticks >= AIRBORNE_CONFIRM_TICKS:
+        raise RuntimeError(
+            f"AIRBORNE/CONTACT LOSS at tick {tick}: {reason} for {run_ticks} ticks "
+            f"-> damping + soft handoff to onboard")
+    return run_ticks, metrics
+
+
+def _assess_feet_planted(leg_infos):
+    """Aggregate passive pre-release samples into an advisory/enforcement result."""
+    samples = list(leg_infos)
+    if not samples:
+        return {"clear": False, "samples": 0, "candidate_samples": 0,
+                "max_divergence_mps": 1.0e9, "max_min_speed_mps": 1.0e9}
+    metrics, candidates = [], []
+    for info in samples:
+        bad, _, m = _airborne_contact_signal(
+            info, AIRBORNE_START_DIVERGENCE_MPS, AIRBORNE_START_BOTH_SPEED_MPS)
+        candidates.append(bad)
+        metrics.append(m)
+    # Require a majority so a single noisy DDS/joint-velocity sample cannot refuse a start.
+    bad_count = int(sum(candidates))
+    required = max(1, (len(samples) + 1) // 2)
+    return {
+        "clear": bad_count < required,
+        "samples": len(samples),
+        "candidate_samples": bad_count,
+        "max_divergence_mps": float(max(m["divergence_mps"] for m in metrics)),
+        "max_min_speed_mps": float(max(m["min_speed_mps"] for m in metrics)),
+    }
+
+
+def _check_feet_planted(legodom, sub, first_state):
+    """Passive pre-release contact check; returns a JSON-safe assessment dict.
+
+    This is called while onboard balance still owns the robot. `enforce` refuses with
+    SystemExit BEFORE any low-level release; `advisory` only prints and records evidence.
+    """
+    mode = AIRBORNE_START_GUARD
+    if mode not in {"off", "advisory", "enforce"}:
+        raise SystemExit(
+            f"REFUSED: AIRBORNE_START_GUARD must be off/advisory/enforce, got {mode!r}")
+    if mode == "off":
+        return {"mode": mode, "clear": None, "samples": 0,
+                "limitation": "passive kinematics cannot prove weight-bearing"}
+
+    states = [first_state]
+    for _ in range(AIRBORNE_START_SAMPLES - 1):
+        time.sleep(1.0 / CONTROL_HZ)
+        states.append(read_state(sub, timeout_s=0.5))
+    infos = []
+    try:
+        for q, dq, imu_quat, gyro, _ in states:
+            _, _, info = legodom.estimate(q, dq, quat_wxyz_to_mat(imu_quat), gyro)
+            infos.append(info)
+    finally:
+        # Precheck samples must not seed the velocity smoother used by the policy phase.
+        legodom.reset_filter()
+    result = _assess_feet_planted(infos)
+    result.update({"mode": mode,
+                   "limitation": "passive kinematics cannot prove weight-bearing"})
+    detail = (f"{result['candidate_samples']}/{result['samples']} suspect samples, "
+              f"max foot disagreement {result['max_divergence_mps']:.2f} m/s, "
+              f"both-foot speed {result['max_min_speed_mps']:.2f} m/s")
+    if not result["clear"]:
+        msg = (f"feet/contact precheck found unstable kinematics ({detail}). A still suspended "
+               f"robot may still pass because LowState has no foot-force signal")
+        if mode == "enforce":
+            raise SystemExit(
+                f"REFUSED: {msg}. Onboard balance untouched (nothing was released).")
+        print(f"   AIRBORNE ADVISORY: {msg}. Do not arm unless both feet are visibly flat "
+              f"and fully loaded; keep the damping remote in hand.")
+    else:
+        print(f"   contact precheck clear ({detail}) — advisory only; this does NOT prove "
+              f"the feet are loaded. Visually confirm both feet flat before arming.")
+    return result
+
+
 def _fall_signal(R_base, h_est, h0, ref_dz):
     """(is_fall_this_tick, reason) — the raw per-tick fall condition, NOT yet debounced.
     Topple: pelvis uprightness R_base[2,2] < FALL_UPRIGHT_MIN. Height collapse: the torso sits
@@ -1547,10 +1713,12 @@ def mode_ground_run_legodom(meta, session, ref, iface, watch, max_secs, exit_mod
     legodom.reset_filter()  # clear the velocity smoother so no stale value leaks in
     make_dds(iface)
     sub = lowstate_subscriber()
-    q0, _, quat0, _, msg0 = read_state(sub)
+    q0, dq0, quat0, gyro0, msg0 = read_state(sub)
     mode_machine = int(msg0.mode_machine)
     _check_start_upright(quat0)   # refuse a non-upright start BEFORE releasing onboard (stays safe)
     _check_start_near_default(q0, meta)  # refuse a far-from-ready start (entry-fall guard, pre-release)
+    start_contact = _check_feet_planted(
+        legodom, sub, (q0, dq0, quat0, gyro0, msg0))  # advisory/enforce happens PRE-release
     # ENTRY HANDOFF: pre-arm the publisher + damp context + signal handler BEFORE releasing
     # onboard, so there is zero setup latency in the unheld release window (fall risk untethered).
     pub, low_cmd, crc = _lowcmd_setup()
@@ -1574,6 +1742,11 @@ def mode_ground_run_legodom(meta, session, ref, iface, watch, max_secs, exit_mod
     last_action = np.zeros(meta.n)
     last_target = meta.default.copy()
     fall_ticks = 0                     # consecutive-tick fall-condition counter (debounce)
+    airborne_ticks = 0                 # consecutive contact-loss-candidate ticks (debounce)
+    airborne_candidate_ticks = 0
+    airborne_max_run = 0
+    airborne_max_divergence = 0.0
+    airborne_max_both_speed = 0.0
     # Policy-phase gains: boost the LEGS so they can bear weight and hold standing while the
     # arms dance at their trained gains. GROUND_LEG_KP_SCALE=1.0 -> unchanged (old behaviour).
     kp_pol, kd_pol = meta.kp.astype(float).copy(), meta.kd.astype(float).copy()
@@ -1592,7 +1765,15 @@ def mode_ground_run_legodom(meta, session, ref, iface, watch, max_secs, exit_mod
         print(f"   GRAVITY FEEDFORWARD on (x{GRAVITY_FF_SCALE:.2f}) — EXPERIMENTAL "
               f"(see audit note at the GRAVITY_FF flag).")
     global _TELEM
-    telem = _TELEM = Telemetry("ground-run-legodom", meta)
+    telem = _TELEM = Telemetry("ground-run-legodom", meta, extra={
+        "airborne_contact_guard": {
+            "trip_enabled": AIRBORNE_TRIP,
+            "divergence_mps": AIRBORNE_DIVERGENCE_MPS,
+            "both_speed_mps": AIRBORNE_BOTH_SPEED_MPS,
+            "confirm_ticks": AIRBORNE_CONFIRM_TICKS,
+            "start": start_contact,
+        }
+    })
     clock = TickClock()
     _acap = action_cap_vector(meta, GROUND_MAX_ACTION)
     try:
@@ -1608,12 +1789,23 @@ def mode_ground_run_legodom(meta, session, ref, iface, watch, max_secs, exit_mod
             t0 = time.perf_counter()
             q, dq, imu_quat, gyro, msg = read_state(sub, timeout_s=0.5)
             R_base = quat_wxyz_to_mat(imu_quat)
-            v_body, h_est, _ = legodom.estimate(q, dq, R_base, gyro)
+            v_body, h_est, leg_info = legodom.estimate(q, dq, R_base, gyro)
             v_world = R_base @ v_body
             ref_disp = ref.at(tick)[2] - ref.apos[0]
             # debounced physical-state fall trigger (topple OR choreography-relative height
             # collapse) -> on a confirmed trip, damp + soft handoff to onboard
             fall_ticks = _check_fall(fall_ticks, R_base, h_est, h0, ref_disp[2], tick)
+            # Contact-loss heuristic is measured on every run for threshold evidence, but can
+            # only raise when AIRBORNE_TRIP=1. A confirmed trip shares the proven damp/handoff
+            # exception path with the physical fall detector.
+            airborne_ticks, contact_metrics = _check_airborne_contact(
+                airborne_ticks, leg_info, tick)
+            airborne_candidate_ticks += int(airborne_ticks > 0)
+            airborne_max_run = max(airborne_max_run, airborne_ticks)
+            airborne_max_divergence = max(
+                airborne_max_divergence, contact_metrics["divergence_mps"])
+            airborne_max_both_speed = max(
+                airborne_max_both_speed, contact_metrics["min_speed_mps"])
             # XY: tracking assumption (in-place dance) -> anchor XY ~0, drift-free.
             # Z: real height change from leg odom (bias cancels in the displacement).
             robot_disp = np.array([ref_disp[0], ref_disp[1], h_est - h0])
@@ -1650,6 +1842,12 @@ def mode_ground_run_legodom(meta, session, ref, iface, watch, max_secs, exit_mod
         print(f"\nSTOP: {e} -> damping")
     finally:
         _damp(pub, low_cmd, crc, mode_machine, meta, secs=1.0)
+        telem.extra["airborne_contact_guard"].update({
+            "candidate_ticks": airborne_candidate_ticks,
+            "max_candidate_run_ticks": airborne_max_run,
+            "max_divergence_mps": airborne_max_divergence,
+            "max_both_speed_mps": airborne_max_both_speed,
+        })
         telem.extra["tick_timing"] = clock.report()   # into the run npz (report never raises)
     _finalize_and_exit(0)
 

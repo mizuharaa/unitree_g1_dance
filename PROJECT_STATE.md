@@ -46,6 +46,21 @@ Motion vetting gate enforces ≤1.5 m root excursion (2 m-radius dance area).
 
 ## Decision log
 
+- 2026-07-13 (Agent B): **Airborne/contact-loss guard software COMPLETE; hardware gate
+  UNFINISHED.** `ground-run-legodom` now performs a passive per-foot kinematic precheck before
+  releasing onboard control (default advisory; supervised `AIRBORNE_START_GUARD=enforce`) and
+  measures a debounced in-loop contact-loss predicate on every run (`AIRBORNE_TRIP=1` required
+  to enforce). A normal single-foot step cannot trip on disagreement alone: both feet must
+  imply >=0.60 m/s while their implied base velocities differ >=2.25 m/s for 12 consecutive
+  ticks. Offline replay over 10 real ground runs / 15,588 ticks found 94 isolated candidates,
+  longest run 7, and 0 would-be trips (`tools/airborne_guard_replay.py`, raw summary under
+  `data/telemetry/airborne_guard_20260713/`). Unit tests cover debounce, fail-closed evidence,
+  step suppression, advisory/enforce modes, and precheck-before-release ordering. HONEST LIMIT:
+  `unitree_hg` has no foot-force field, so passive q/dq/IMU cannot distinguish a perfectly still
+  hanging robot from a still grounded one. Enforcement stays default-off pending supervised
+  feet-off gantry detection + full grounded-dance false-positive validation; exact remaining
+  work is in `tasks/AGENT_B_AIRBORNE_CONTACT_GUARD.md`.
+
 - 2026-07-10: **Sim sandbox HONESTY fix — it under-represents the dance; not calibrated yet.**
   User caught that the policy "doesn't dance" in the Simulation tab. Diagnosed: (1) a tether hack
   (kp 150) I added PINNED the base -> crushed motion to 8%; (2) even free, the policy's joints
