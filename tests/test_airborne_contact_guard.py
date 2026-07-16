@@ -145,6 +145,8 @@ def test_legodom_mode_runs_contact_precheck_before_releasing_onboard(monkeypatch
         kp = np.ones(29)
         kd = np.ones(29)
         action_scale = np.ones(29)
+        q_lo = np.zeros(29) - np.deg2rad(140)
+        q_hi = np.zeros(29) + np.deg2rad(140)
 
     class Ref:
         T = 1

@@ -31,8 +31,9 @@ from fastapi.staticfiles import StaticFiles
 
 from pipeline.config import DATA_DIR, STAGE_ORDER
 from pipeline import audio as audio_mod
-from pipeline import (body_models, cloud, monitor, policy_store, preshow, setlist,
-                      show_runner, shows, sim_preview, store, venue)
+from pipeline import (body_models, cloud, landmark_preview, monitor, policy_store,
+                      preshow, setlist, show_runner, shows, sim_preview, store, venue,
+                      video_edit, video_quality, video_web)
 from pipeline.runner import Runner
 from pipeline.stages.local_motion import build_stages
 
@@ -171,6 +172,12 @@ def _job_dict(job: store.Job) -> dict:
     vet = job.dir / "retarget" / "vet.json"
     if vet.exists():
         d["vet"] = json.loads(vet.read_text())
+    quality = job.dir / "quality.json"          # upload-time video quality gate (video_quality)
+    if quality.exists():
+        try:
+            d["quality"] = json.loads(quality.read_text())
+        except (ValueError, OSError):
+            pass
     return d
 
 
@@ -210,8 +217,39 @@ def _create_job(name: str, src: Path, *, move: bool = False) -> store.Job:
     else:
         shutil.copyfile(src, dest)
     job.log(f"input {kind}: {src.name} ({size} bytes)")
+    if kind == "video":
+        dur = video_edit.probe_duration(dest)
+        if dur > video_edit.MAX_UNTRIMMED_S:
+            # Too long — gate for trimming (do NOT queue or score yet). The UI shows the trimmer;
+            # POST /trim cuts a <=4 min segment, then scores + queues it.
+            job.input["needs_trim"] = True
+            job.input["duration_s"] = round(dur, 1)
+            job.save()
+            job.log(f"video is {dur:.0f}s (> {video_edit.MAX_UNTRIMMED_S}s / 4 min) — "
+                    "select a <=4 min segment in the trimmer before processing")
+            return job
+        _quality_check_async(job.dir, dest)     # scores the clip on the 1-10 rubric (video_quality)
     _job_queue.put(job.id)
     return job
+
+
+def _quality_check_async(job_dir: Path, video_path: Path) -> None:
+    """Run the upload-time video quality gate in the background (~3 s) and write the rubric to
+    job_dir/quality.json. Kept out of the job record so it can't race the stage worker's saves."""
+    import threading
+
+    def _work() -> None:
+        try:
+            rubric = video_quality.analyze(video_path)
+        except Exception as e:  # noqa: BLE001 — advisory gate must never break job creation
+            rubric = {"ok": False, "verdict": "error",
+                      "recommendation": f"quality check failed: {type(e).__name__}", "dimensions": {}}
+        try:
+            (job_dir / "quality.json").write_text(json.dumps(rubric, indent=2))
+        except OSError:
+            pass
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 @app.post("/api/jobs")
@@ -276,6 +314,79 @@ def retry_job(job_id: str) -> dict:
     st.started_at = st.finished_at = None
     job.save()
     job.log(f"stage {cur}: reset by user — re-queued")
+    _job_queue.put(job.id)
+    return _job_dict(job)
+
+
+@app.get("/api/jobs/{job_id}/frame")
+def job_frame(job_id: str, t: float = 0.0) -> FileResponse:
+    """A single jpg frame at time `t` (seconds) from the job's input video — powers the trimmer
+    scrubber (the desktop webview can't play H.264 but renders jpg fine). Cached per 0.1 s."""
+    try:
+        job = store.load_job(job_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"no such job: {job_id}")
+    src = job.dir / "input.mp4"
+    if not src.exists():
+        raise HTTPException(404, "job has no input video")
+    tkey = max(0.0, round(float(t), 1))
+    cache = job.dir / "frames" / f"{tkey:.1f}.jpg"
+    if not cache.exists() and not video_edit.extract_frame(src, tkey, cache):
+        raise HTTPException(500, "could not extract a frame at that time")
+    return FileResponse(cache, media_type="image/jpeg")
+
+
+@app.get("/api/jobs/{job_id}/proxy")
+def job_proxy(job_id: str) -> dict:
+    """Ensure a scrubbable VP9/WebM proxy of the job's input video exists (so the trimmer can PLAY
+    it inline in the desktop webview), transcoding on demand. Returns {ready, url?, status?}. The
+    proxy lives under /previews so the Range-capable static mount serves it (seeking works)."""
+    try:
+        job = store.load_job(job_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"no such job: {job_id}")
+    src = job.dir / "input.mp4"
+    if not src.exists():
+        raise HTTPException(404, "job has no input video")
+    out = PREVIEWS_DIR / "proxy" / f"{job_id}.webm"
+    result = video_edit.ensure_proxy(src, out)
+    if result.get("ready"):
+        result["url"] = f"/previews/proxy/{job_id}.webm"
+    return result
+
+
+@app.post("/api/jobs/{job_id}/trim")
+def trim_job(job_id: str, payload: dict = Body(...)) -> dict:
+    """Cut the job's (too-long) input video down to the chosen <=4 min segment, then score +
+    queue it. Body: {start_s, length_s}. Only valid for a job flagged needs_trim."""
+    try:
+        job = store.load_job(job_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"no such job: {job_id}")
+    if not job.input.get("needs_trim"):
+        raise HTTPException(400, "this job does not need trimming")
+    dur = float(job.input.get("duration_s") or 0)
+    start = float(payload.get("start_s", 0))
+    length = float(payload.get("length_s", video_edit.MAX_UNTRIMMED_S))
+    if (start < 0 or length < video_edit.MIN_SEGMENT_S
+            or length > video_edit.MAX_UNTRIMMED_S + 1 or start + length > dur + 1.5):
+        raise HTTPException(400, f"invalid segment start={start:.0f}s length={length:.0f}s "
+                                 f"(video {dur:.0f}s, max {video_edit.MAX_UNTRIMMED_S}s)")
+    src = job.dir / "input.mp4"
+    trimmed = job.dir / "trimmed.mp4"
+    try:
+        video_edit.trim(src, trimmed, start, length)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"trim failed: {type(e).__name__}")
+    trimmed.replace(src)                                   # the segment IS the input now
+    shutil.rmtree(job.dir / "frames", ignore_errors=True)  # stale scrubber cache
+    (job.dir / "quality.json").unlink(missing_ok=True)     # re-score the segment, not the full clip
+    job.input.pop("needs_trim", None)
+    job.input["trimmed"] = {"start_s": round(start, 1), "length_s": round(length, 1)}
+    job.input["duration_s"] = round(video_edit.probe_duration(src), 1)
+    job.save()
+    job.log(f"trimmed to [{start:.0f}s, +{length:.0f}s]; scoring + queueing")
+    _quality_check_async(job.dir, src)
     _job_queue.put(job.id)
     return _job_dict(job)
 
@@ -371,7 +482,7 @@ def _system_refresh_loop() -> None:
             _system_snapshot = monitor.snapshot()
         except Exception:  # snapshot() shouldn't raise, but never kill the thread
             pass
-        time.sleep(20)
+        time.sleep(8)  # box snapshot cadence (was 20) — training status feels live
 
 
 @app.get("/api/system")
@@ -426,6 +537,24 @@ def vet(csv: str) -> dict:
     return _vet_cache[key]
 
 
+@app.get("/api/preview-webm")
+def preview_webm(src: str) -> dict:
+    """Ensure a VP9/WebM sibling of a preview mp4 exists so the codec-limited desktop webview
+    can play it INLINE (no H.264). Transcodes on demand (cached). `src` is a /previews/... URL
+    path. Returns {ready, url?, status?}; poll until ready, then play `url`."""
+    rel = src.split("/previews/", 1)[-1].lstrip("/")
+    parts = [p for p in rel.split("/") if p and p != "."]
+    # traversal guard (don't resolve — previews can be SYMLINKS out of the tree; the .webm is
+    # written next to the symlink under /previews, and ffmpeg follows the symlink to read).
+    if any(p == ".." for p in parts) or not parts or not parts[-1].endswith(".mp4"):
+        raise HTTPException(400, "src must be a .mp4 under /previews")
+    mp4 = PREVIEWS_DIR.joinpath(*parts)
+    result = video_web.ensure_webm(mp4)
+    if result.get("ready"):
+        result["url"] = "/previews/" + video_web.webm_sibling(mp4).relative_to(PREVIEWS_DIR).as_posix()
+    return result
+
+
 @app.get("/api/previews")
 def previews() -> list[dict]:
     files = sorted(PREVIEWS_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime,
@@ -449,6 +578,24 @@ def render_dance_sim(dance_id: str) -> dict:
     if not dance.policy_path:
         raise HTTPException(409, "dance has no trained policy yet — nothing to simulate")
     return sim_preview.render_async(dance)
+
+
+# ---- Simulation tab: pose-estimation landmark overlay (debug garbage-in) ----------
+@app.get("/api/dances/{dance_id}/landmark")
+def dance_landmark(dance_id: str) -> dict:
+    """Status (+url when ready) of the GVHMR landmark overlay for this dance's source video."""
+    dance = _load_dance_or_404(dance_id)
+    return landmark_preview.status(getattr(dance, "source_job", None) or "")
+
+
+@app.post("/api/dances/{dance_id}/landmark")
+def render_dance_landmark(dance_id: str) -> dict:
+    """Render (background) the landmark overlay for this dance's source video; poll GET for status."""
+    dance = _load_dance_or_404(dance_id)
+    job = getattr(dance, "source_job", None)
+    if not job:
+        raise HTTPException(409, "dance has no source video job — nothing to overlay")
+    return landmark_preview.render_async(job)
 
 
 # ---- show mode: dance library ---------------------------------------------------

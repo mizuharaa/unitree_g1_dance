@@ -36,7 +36,10 @@ echo '@@TMUX@@'
 echo '@@STATUS@@'
 for f in /workspace/notebook-data/jobs/*.status.json; do [ -e "$f" ] || continue; echo "@@FILE $(basename "$f" .status.json)@@"; cat "$f" 2>/dev/null; echo; done
 echo '@@LOGS@@'
-for f in /workspace/notebook-data/jobs/*.log; do [ -e "$f" ] || continue; case "$(basename "$f")" in train*|*train*) echo "@@FILE $(basename "$f" .log)@@"; grep -E 'Learning iteration|Mean reward:|Mean episode length:|wandb.ai' "$f" 2>/dev/null | tail -10;; esac; done
+for f in /workspace/notebook-data/jobs/*.log; do [ -e "$f" ] || continue; case "$(basename "$f")" in train*|*train*) echo "@@FILE $(basename "$f" .log)@@"; grep -E 'Learning iteration|Mean reward:|Mean episode length:|Time elapsed|ETA:|Iteration time|wandb.ai' "$f" 2>/dev/null | tail -24;; esac; done
+AT=$(ls -t /workspace/notebook-data/attempt*.out 2>/dev/null | head -1); [ -n "$AT" ] && { echo "@@FILE train-$(basename "$AT" .out)@@"; grep -E 'Learning iteration|Mean reward:|Mean episode length:|Time elapsed|ETA:|Iteration time|wandb.ai' "$AT" 2>/dev/null | tail -24; }
+echo '@@PROC@@'
+ps -eo args= 2>/dev/null | grep -cE '[s]im2real_task_v[0-9]|[t]rain_sim2real'
 """.strip()
 
 
@@ -67,10 +70,16 @@ def parse_gpu(line: str) -> dict | None:
     }
 
 
+def _hms_to_s(h: str, m: str, s: str) -> int:
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+
 def parse_job_log(name: str, text: str) -> dict:
-    """Pull latest iteration / max, reward, episode length, W&B url from a log tail."""
+    """Pull latest iteration / max, reward, episode length, ETA, elapsed, per-iter time
+    and W&B url from a log tail (rsl_rl on-policy runner format)."""
     info: dict = {"name": name, "iteration": None, "max_iteration": None,
-                  "mean_reward": None, "mean_episode_length": None, "wandb_url": None}
+                  "mean_reward": None, "mean_episode_length": None, "wandb_url": None,
+                  "eta_s": None, "elapsed_s": None, "iteration_time_s": None}
     for m in re.finditer(r"Learning iteration\s+(\d+)\s*/\s*(\d+)", text):
         info["iteration"], info["max_iteration"] = int(m.group(1)), int(m.group(2))
     rewards = re.findall(r"Mean reward:\s*([-+]?\d*\.?\d+)", text)
@@ -79,6 +88,17 @@ def parse_job_log(name: str, text: str) -> dict:
     eps = re.findall(r"Mean episode length:\s*([-+]?\d*\.?\d+)", text)
     if eps:
         info["mean_episode_length"] = float(eps[-1])
+    # rsl_rl prints "Time elapsed: H:MM:SS", "ETA: H:MM:SS" (current train() call — i.e.
+    # this curriculum STAGE), and "Iteration time: N.NNs". Take the most recent of each.
+    el = re.findall(r"Time elapsed:\s*(\d+):(\d+):(\d+)", text)
+    if el:
+        info["elapsed_s"] = _hms_to_s(*el[-1])
+    eta = re.findall(r"ETA:\s*(\d+):(\d+):(\d+)", text)
+    if eta:
+        info["eta_s"] = _hms_to_s(*eta[-1])
+    it = re.findall(r"Iteration time:\s*([\d.]+)\s*s", text)
+    if it:
+        info["iteration_time_s"] = float(it[-1])
     urls = re.findall(r"https?://(?:\w+\.)?wandb\.ai/\S+", text)
     if urls:
         info["wandb_url"] = urls[-1].rstrip(".,)")
@@ -125,11 +145,18 @@ def parse_gather(raw: str) -> dict:
     """Split the combined gather output into gpu / tmux / jobs sections."""
     gpu_txt, _, rest = raw.partition("@@TMUX@@")
     tmux_txt, _, rest = rest.partition("@@STATUS@@")
-    status_txt, _, logs_txt = rest.partition("@@LOGS@@")
+    status_txt, _, rest2 = rest.partition("@@LOGS@@")
+    logs_txt, _, proc_txt = rest2.partition("@@PROC@@")
 
     gpu = parse_gpu(gpu_txt.strip().splitlines()[0] if gpu_txt.strip() else "")
     sessions = [ln.split(":")[0] for ln in tmux_txt.strip().splitlines()
                 if ln.strip() and ln.strip() != "NONE" and ":" in ln]
+    # True process check — the runner uses nohup/setsid (no tmux on this box), so tmux-session
+    # liveness alone always reads "finished". A live train_sim2real proc means training is running.
+    try:
+        training_active = int(proc_txt.strip().splitlines()[0]) > 0
+    except (ValueError, IndexError):
+        training_active = False
 
     statuses: dict[str, dict] = {}
     parts = re.split(r"@@FILE (\S+)@@", status_txt)
@@ -145,7 +172,7 @@ def parse_gather(raw: str) -> dict:
         # trusted on its own: a SIGKILL'd job never writes its terminal status,
         # so a stale log/"running" lingers with no session (this is exactly what
         # made retired jobs show as "Active Training" forever).
-        return f"job-{name}" in sessions or name in sessions
+        return f"job-{name}" in sessions or name in sessions or training_active
 
     def _state(name: str, live: bool, st: dict) -> str:
         if live:
@@ -175,12 +202,34 @@ def parse_gather(raw: str) -> dict:
             jobs.append({"name": name, "state": "running", "live": True,
                          "running": True, "started_at": st.get("started_at")})
 
-    return {"gpu": gpu, "tmux_sessions": sessions, "jobs": jobs}
+    return {"gpu": gpu, "tmux_sessions": sessions, "jobs": jobs,
+            "training_active": training_active}
 
 
 # ---- live gather (cached, degrades gracefully) -------------------------------
 
 _last_good: dict = {}
+
+
+def augment_job_plan(job: dict, plan: dict) -> dict:
+    """Add whole-training fields from a `training_plan` config block:
+      total_eta_s = seconds to the ENTIRE curriculum finishing = remaining iters to the
+                    final target × current per-iter time + the fixed verify-chain seconds.
+                    (The per-stage `eta_s` from rsl_rl only covers the CURRENT stage.)
+      stage / total_stages = which curriculum stage we're in, from stage_boundaries.
+    Returns the job dict (mutated). No-ops gracefully when the plan or live values are absent."""
+    if not plan:
+        return job
+    it, itt = job.get("iteration"), job.get("iteration_time_s")
+    final = plan.get("final_target_iter")
+    if final and it and itt:
+        remaining = max(0, int(final) - int(it))
+        job["total_eta_s"] = round(remaining * float(itt) + float(plan.get("verify_seconds", 0)))
+    bounds = plan.get("stage_boundaries") or []
+    if bounds and it:
+        job["stage"] = next((i + 1 for i, b in enumerate(bounds) if it <= b), len(bounds))
+        job["total_stages"] = len(bounds)
+    return job
 
 
 def snapshot(timeout: int = 20) -> dict:
@@ -203,6 +252,9 @@ def snapshot(timeout: int = 20) -> dict:
             raise RuntimeError((stderr or "gather failed").strip()[-200:])
         parsed = parse_gather(stdout)
         out.update(parsed)
+        plan = cfg.get("training_plan") or {}
+        for job in out.get("jobs", []):
+            augment_job_plan(job, plan)
         out["reachable"] = True
         out["detail"] = "ok"
         _last_good = {**out}

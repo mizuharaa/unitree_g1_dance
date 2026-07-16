@@ -9,15 +9,30 @@ export interface JobStage {
   meta?: Record<string, unknown>
 }
 
+export interface QualityDim { score?: number; value?: string; note?: string; flag?: string | null }
+export interface VideoQuality {
+  ok?: boolean
+  verdict?: string           // good | acceptable | poor | unreadable | error
+  overall_score?: number
+  difficulty?: QualityDim
+  dimensions?: Record<string, QualityDim>
+  blockers?: string[]
+  flags?: string[]
+  warnings?: string[]
+  recommendation?: string
+  duration_s?: number
+}
+
 export interface PipelineJob {
   id: string
   name: string
   created_at: number
-  input?: { type?: string; source?: string }
+  input?: { type?: string; source?: string; needs_trim?: boolean; duration_s?: number; trimmed?: { start_s?: number; length_s?: number } }
   current_stage?: string | null
   stages: Record<string, JobStage>
   preview_url?: string
   vet?: VetReport
+  quality?: VideoQuality
   log_tail?: string[]
 }
 
@@ -98,7 +113,8 @@ export interface SystemStatus {
   reachable?: boolean
   stale?: boolean
   gpu?: { utilization_pct?: number; memory_used_mb?: number; memory_total_mb?: number; temperature_c?: number; name?: string; [key: string]: unknown } | null
-  jobs?: Array<{ name: string; iteration?: number; max_iteration?: number; mean_reward?: number; mean_episode_length?: number; wandb_url?: string }>
+  jobs?: Array<{ name: string; iteration?: number; max_iteration?: number; mean_reward?: number; mean_episode_length?: number; wandb_url?: string; progress?: number; eta_s?: number; elapsed_s?: number; iteration_time_s?: number; total_eta_s?: number; stage?: number; total_stages?: number; running?: boolean; state?: string }>
+  training_active?: boolean
   cost?: { hours?: number; rate_vnd_per_hour?: number; accrued_vnd?: number; accrued_usd?: number; cap_vnd?: number; cap_fraction?: number; over_cap?: boolean }
   detail?: string
 }

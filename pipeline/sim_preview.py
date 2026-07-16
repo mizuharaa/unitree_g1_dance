@@ -12,6 +12,7 @@ the UI polls list_sims() for status. No robot, no GPU — pure MuJoCo + onnxrunt
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -30,6 +31,22 @@ _lock = threading.Lock()
 
 
 def _sha8(dance) -> str:
+    """Version key = hash of the policy.onnx FILE, not dance.policy_sha256.
+
+    attach_policy() intentionally clears dance.policy_sha256 (the exam must re-run),
+    so keying on it collapsed EVERY retrain to the literal string "nopolicy" ->
+    one stale nopolicy.mp4 that render_async saw as already-present and never
+    re-rendered. Hashing the actual policy file gives each distinct policy its own
+    version, so a retrain reliably produces a NEW preview (and before/after works)."""
+    p = getattr(dance, "policy_path", None)
+    if p:
+        fp = PROJECT_ROOT / p
+        if fp.is_file():
+            h = hashlib.sha256()
+            with open(fp, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()[:8]
     return (getattr(dance, "policy_sha256", None) or "nopolicy")[:8]
 
 
@@ -50,14 +67,26 @@ def list_sims(dance_id: str) -> list[dict]:
     d = _sim_dir(dance_id)
     if d.exists():
         for j in sorted(d.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            # ONLY the version meta `<sha8>.json`. A bare *.json glob also matched
+            # `<sha>.report.json`, fabricating a bogus newest "version" whose
+            # `<sha>.report.mp4` doesn't exist -> the UI auto-selected it -> blank
+            # player (2026-07-16 "video showing nothing" bug).
+            sha = j.stem
+            if "." in sha or not (d / f"{sha}.mp4").exists():
+                continue
             try:
                 meta = json.loads(j.read_text())
             except Exception:
                 meta = {}
-            sha = j.stem
+            overlay = d / f"{sha}.overlay.mp4"
+            vs_orig = d / f"{sha}.vs_original.mp4"
             out.append({
                 "sha": sha,
                 "url": f"/previews/sim/{dance_id}/{sha}.mp4",
+                "overlay_url": (f"/previews/sim/{dance_id}/{sha}.overlay.mp4"
+                                if overlay.exists() else None),
+                "vs_original_url": (f"/previews/sim/{dance_id}/{sha}.vs_original.mp4"
+                                    if vs_orig.exists() else None),
                 "achieved": meta.get("right_achieved"),
                 "created_at": meta.get("created_at"),
                 "policy_sha256": meta.get("policy_sha256"),
@@ -81,11 +110,45 @@ def render_async(dance) -> dict:
             return {"status": "rendering", "sha": sha}
         if mp4.exists():
             _status.pop(key, None)
+            overlay = _sim_dir(dance.id) / f"{sha}.overlay.mp4"
             return {"status": "ready", "sha": sha,
-                    "url": f"/previews/sim/{dance.id}/{sha}.mp4"}
+                    "url": f"/previews/sim/{dance.id}/{sha}.mp4",
+                    "overlay_url": (f"/previews/sim/{dance.id}/{sha}.overlay.mp4"
+                                    if overlay.exists() else None)}
         _status[key] = "rendering"
     threading.Thread(target=_render, args=(dance, sha), daemon=True).start()
     return {"status": "rendering", "sha": sha}
+
+
+def render_sync(dance) -> dict:
+    """Render the dance's CURRENT policy in the FOREGROUND (blocks until done).
+
+    render_async() spawns a daemon thread, which is right for the long-lived web
+    server but wrong for a short-lived CLI/pull process: the interpreter exits the
+    moment the pull script returns and the daemon thread is killed mid-render, so
+    no mp4 is ever written. Pull/finalize paths (pipeline.publish_policy) call this
+    instead so the render actually completes before the process ends. Idempotent:
+    if the version already exists it is reused, not re-rendered."""
+    sha = _sha8(dance)
+    key = (dance.id, sha)
+    mp4 = _sim_dir(dance.id) / f"{sha}.mp4"
+    if mp4.exists():
+        overlay = _sim_dir(dance.id) / f"{sha}.overlay.mp4"
+        return {"status": "ready", "sha": sha,
+                "url": f"/previews/sim/{dance.id}/{sha}.mp4",
+                "overlay_url": (f"/previews/sim/{dance.id}/{sha}.overlay.mp4"
+                                if overlay.exists() else None)}
+    with _lock:
+        _status[key] = "rendering"
+    _render(dance, sha)
+    st = _status.get(key, "ready")
+    if st == "ready":
+        overlay = _sim_dir(dance.id) / f"{sha}.overlay.mp4"
+        return {"status": "ready", "sha": sha,
+                "url": f"/previews/sim/{dance.id}/{sha}.mp4",
+                "overlay_url": (f"/previews/sim/{dance.id}/{sha}.overlay.mp4"
+                                if overlay.exists() else None)}
+    return {"status": st, "sha": sha}
 
 
 def _render(dance, sha: str) -> None:
@@ -93,13 +156,20 @@ def _render(dance, sha: str) -> None:
     try:
         d = _sim_dir(dance.id)
         d.mkdir(parents=True, exist_ok=True)
-        mp4, meta_p = d / f"{sha}.mp4", d / f"{sha}.report.json"
+        mp4 = d / f"{sha}.mp4"
+        overlay = d / f"{sha}.overlay.mp4"
+        meta_p = d / f"{sha}.report.json"
+        # One rollout, two encodes: side-by-side (reference | policy) AND the same-scene
+        # color-coded overlay. LD_LIBRARY_PATH is needed for the conda MuJoCo/ffmpeg libs.
+        env = {**os.environ, "MUJOCO_GL": "egl"}
+        conda_lib = Path.home() / "miniconda3/envs/g1dance/lib"
+        if conda_lib.exists():
+            env["LD_LIBRARY_PATH"] = f"{conda_lib}:{env.get('LD_LIBRARY_PATH', '')}"
         subprocess.run(
             [sys.executable, "-m", "tools.sim_studio", "--dance", str(_policy_dir(dance)),
              "--steps", "1600", "--tether-kp", "0",     # 0 = honest amplitude (no base pinning)
-             "--out", str(mp4), "--report", str(meta_p)],
-            cwd=str(PROJECT_ROOT), check=True, timeout=1800,
-            env={**os.environ, "MUJOCO_GL": "egl"})
+             "--out", str(mp4), "--overlay-out", str(overlay), "--report", str(meta_p)],
+            cwd=str(PROJECT_ROOT), check=True, timeout=2400, env=env)
         report = json.loads(meta_p.read_text()) if meta_p.exists() else {}
         (d / f"{sha}.json").write_text(json.dumps({
             "label": getattr(dance, "name", dance.id),

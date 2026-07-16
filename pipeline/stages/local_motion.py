@@ -95,13 +95,21 @@ class RetargetStage:
         from ..motion_io import load_motion_csv
         m = load_motion_csv(csv)  # clear error on a malformed CSV, not a traceback
         # Ground-reference before window/vet so the absolute-z gate is meaningful
-        # (audit HIGH: GMR retarget output is not floor-referenced). Idempotent.
-        from ..grounding import UNGROUNDED_FLAG_M, ground_motion, have_model
+        # AND the support foot doesn't float (§3.3 'floaty feet' source defect).
+        # Per-frame grounding removes the retarget's slow vertical drift so the
+        # planted foot sits on z≈0 every frame (a single global offset — the old
+        # behaviour — plants only the one lowest instant and left the foot
+        # floating >0.10 m in ~78% of the Thriller). Relative heights (root-above-
+        # foot) are preserved exactly; idempotent on an already-grounded motion.
+        from ..grounding import ground_motion_per_frame, have_model
         if have_model():
-            m, shift = ground_motion(m)
-            if abs(shift) > UNGROUNDED_FLAG_M:
-                job.log(f"retarget: grounded motion (input contact was "
-                        f"{shift:+.3f} m off the floor)")
+            m, ginfo = ground_motion_per_frame(m)
+            if ginfo["drift_removed_mm"] > 5.0 or ginfo["mean_shift_m"] > 0.01:
+                job.log(f"retarget: per-frame grounded motion (removed "
+                        f"{ginfo['drift_removed_mm']:.0f} mm of vertical drift, "
+                        f"mean shift {ginfo['mean_shift_m']:+.3f} m"
+                        + (f", {ginfo['flight_frames']} flight frames held"
+                           if ginfo['flight_frames'] else "") + ")")
         if params["window_start_s"] is not None and params["window_end_s"] is not None:
             # explicit per-dance window (dance.yaml) — still subject to the vet gate
             s = max(0, int(round(float(params["window_start_s"]) * CSV_FPS)))
@@ -185,6 +193,21 @@ class RetargetStage:
         st.meta["ramp"] = make_deploy_csv(show_csv, deploy_csv)
         st.meta["show_csv"] = str(show_csv)
         st.meta["deploy_csv"] = str(deploy_csv)
+
+        # Post-clean HARD backstop (cost guard): the vet gate above runs on the
+        # RAW motion and only WARNS on glitch (prep de-glitches downstream). If
+        # clean_motion STILL couldn't get this motion under the severe floor,
+        # refuse now — before the human ever sees an "approve training" button —
+        # rather than pay for a 5 h GPU run on unfixable data. Safe on the
+        # cleaned Thriller (7.6k jerk); only a broken source trips it.
+        from ..vet_motion import severe_after_clean
+        severe = severe_after_clean(str(show_csv))
+        st.meta["severe_after_clean"] = severe
+        if severe:
+            raise RuntimeError(
+                "motion still severely glitchy/infeasible AFTER de-glitch "
+                f"({', '.join(severe)}) — fix the source clip or retarget; "
+                "refusing to spend GPU on it")
         job.log(f"retarget: deployable motion ready — {deploy_csv.name} "
                 f"({st.meta['ramp']['seconds']}s incl. 2.5s activation ramp)")
         report(1.0, "motion ready — review the preview, then approve training")

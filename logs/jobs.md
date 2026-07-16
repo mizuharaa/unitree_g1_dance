@@ -313,3 +313,73 @@ onboard AI-stand, not a custom phone pose; feet-off/gantry for the first validat
 - Changes vs ankle policy: latency DR 0-80ms (was 0-20ms, commit 86110b9) + drift weight 1.0
 - Verify plan: gap_check gated at 40ms+push (was 20ms) + 60/80ms stress lines; heldout x3
 - tmux session 'train' on box; log $NB/train_lat.log
+
+## 2026-07-13 — V5 LATENCY-CURRICULUM RETRAIN LAUNCHED (thriller, clean motion)
+- Box: fresh GreenNode 4090, ssh `root@103.245.250.152:55792`, key `.secrets/greennode_rsa` (RSA).
+  Volume was EMPTY (g1dance-data gone) -> full re-provision done (mjlab_ready, isolated venv py3.11).
+  apt is DISABLED on this image; bootstrap used static tmux/ffmpeg. W&B: `wandb login` -> ~/.netrc.
+- Run: `train-thriller_v5fid-0713` (task Mjlab-Tracking-Flat-Unitree-G1-S2R-V5), driver
+  `$NB/cloud/retrain_v5_box.sh` (setsid/nohup, NO tmux on box), log `$NB/logs/train_v5.log`.
+  Motion: de-glitched `thriller_clean.npz` (jerk /21). Curriculum: s1 0-20ms 4000it -> s2 0-50ms
+  +3000 (resume s1) -> s3 0-60ms +3000 (resume s2). Resume flags VERIFIED present. ~1.1s/it (~3.5-4h).
+- Healthy start (~15min in): v5 arm-fidelity terms active (motion_arm_pos 0.167/ori 0.078);
+  motion_global_root_pos 0.06 (WATCH: must climb — lat80 failure was this stalling at 0.05).
+- GATES (auto-run at end): gap_check survival @40ms+push AND nominal drift <1m AND heldout >=99% (3 seeds).
+- RESUME IF SESSION DIES: check `$NB/logs/train_v5.log`; on "==== GATES"/"PULL artifacts" -> pull with
+  `bash scripts/retrain_pull.sh 103.245.250.152 55792` -> sign -> promote -> DELETE BOX (billing!).
+
+## 2026-07-13 (cont.) — stage 2 RELAUNCHED correctly (from model_3999, not model_500)
+- Bug: mjlab's default checkpoint sort is ALPHABETICAL (model_500 > model_3999), and --load-run
+  matches run dirs with re.match (start-anchored) so a bare run-name never matches the
+  "<timestamp>_<name>" dir. A resume attempt had grabbed model_500 (iter 500) — curriculum defeated.
+- Fix: cloud/resume_curriculum_v5.sh resolves the newest run dir + HIGHEST-NUMBERED checkpoint and
+  pins both explicitly. Killed the model_500 run, cleaned aborted s2/s3 dirs, relaunched:
+  stage 2 now resumes 2026-07-13_05-25-45_..._s1 / model_3999.pt (VERIFIED in proc args + log).
+  Log: $NB/logs/resume_v5.log. Monitor from laptop: `bash scripts/train_watch.sh 103.245.250.152 55792`.
+
+## 2026-07-15 03:13 UTC — ATTEMPT 4 (v7) LAUNCHED (extended budget)
+- Box: root@103.245.250.152:57240, key .secrets/greennode_rsa. Run: train-thriller_v7ank-0715.
+- Task Mjlab-Tracking-Flat-Unitree-G1-S2R-V7. Driver: cloud/run_attempt4.sh (detached,
+  attempt4.out). Curriculum: s1 0-20ms/drift0.8/4000 -> s2 0-50ms/drift0.6/+3000 ->
+  s3 0-60ms/drift0.4/+5000 (12k total). MUJOCO_GL unset for train, egl for verify.
+- v7 deltas vs v6 (all evidence-backed): ankle_torque_l2 -6e-4->-1e-3 AND action_rate_l2
+  -0.20->-0.25 (the proven 96da66 pair = ankle p95 10.7 Nm); stage-3 drift 0.5->0.4 + more iters;
+  BEST-checkpoint selection via cloud/pick_checkpoint.py (screens last 6 ckpts, exports winner).
+- Preflight PASSED: motion 2464 frames, GPU 0%, disk 134G, v7 --selfcheck PASS (ankle -0.001,
+  action_rate -0.25), resume-flag present, 64-env GPU smoke test PASS. Confirmed iterating (iter 6,
+  GPU 51%).
+- WATCH: motion_global_root_pos must climb; survival tail is the hard gate (need >=99% nominal).
+- RESUME IF SESSION DIES: tail $NB/attempt4.out; on "==== DONE" -> pull
+  `scp -P 57240 -i .secrets/greennode_rsa root@103.245.250.152:/workspace/notebook-data/exports/train-thriller_v7ank-0715/* exports/train-thriller_v7ank-0715/`
+  -> read gap.json gate -> sign -> DELETE BOX (billing!). This is attempt 4 (budget extended by 1).
+
+## 2026-07-16 — NEW BOX + v8 REDESIGN (history + teacher-student)
+- Box: root@103.245.250.152:46659, key .secrets/greennode_rsa (cloud.json updated). Fresh RTX 4090
+  24GB, driver 580.65, EMPTY 196GB volume (/dev/sdb, no 20GB squeeze). Provisioning in background
+  (00_bootstrap + 20_training mjlab) -> $NB/logs/provision.log; expect mjlab_ready.
+- USER decided (2026-07-16): obs architecture = HISTORY + TEACHER-STUDENT (drop explicit base_lin_vel,
+  give the student obs history to infer velocity, privileged critic/teacher on full sim-truth). KEEP
+  the box running / fast-track. Also requested deploy-safety hardening (never run grounded policy
+  suspended; require foot contact before run; action clamps+rate limits+estimator-validity+independent
+  damping watchdog) and a full obs units/frames/normalization/timing audit.
+- DISPATCHED (parallel, no-GPU): (1) recipe redesign v8 -> history+teacher-student (checks mjlab
+  native obs-history support first); (2) obs audit -> experiments/obs_audit.md (gates train);
+  (3) deploy-safety guards in pipeline/deploy_runtime.py (NON-blocking; robot down).
+- NEXT: reconcile audit fixes into recipe -> re-push cloud/ -> motion prep (ground->repair1.8x->
+  csv_to_npz) -> preflight (v8 --selfcheck + 64-env smoke) -> launch v8 curriculum + Agent A gate
+  calibration (run thriller_csv_ankle_penalty through the gate) in the SAME session. DELETE box when done.
+
+## 2026-07-16 08:21 UTC — V8 (ATTEMPT 5) TRAINING LIVE
+- Box root@103.245.250.152:46659. Run via cloud/run_attempt5.sh detached -> attempt5.out.
+- Env FIXED to known-good (mjlab 1.5.0 + mujoco-warp 3.10.0.1 + warp-lang 1.14.0 + torch cu128);
+  provisioning pin bug fixed (20_training.sh pinned bare mjlab -> pulled 1.5.1; now ==1.5.0).
+- Preflight caught 2 issues at $0 GPU: (1) mjlab version drift; (2) missing G1 MJCF (pushed
+  third_party/unitree_mujoco/.../g1 36MB). Motion prep OK: ground->repair1.8x->csv_to_npz ->
+  thriller_grounded_repaired_1p8x.npz (4435 frames). selfcheck PASS (154/frame x hist5 = 770-flat
+  actor, critic privileged, ankle clamp 40Nm, 1.8x). 64-env smoke PASS. Stage 1/3 iterating (GPU 50%).
+- Recipe: history + teacher-student obs + Agent D candidate A (ankle soft-barrier, ankle action-rate,
+  waist slack at beats, effort clamp) on the 1.8x grounded+repaired motion. Curriculum 3 stages + verify.
+- STILL OWED (this session): Agent A gate CALIBRATION — run thriller_csv_ankle_penalty (~70% IRL)
+  through the gate for the trusted bar; run AFTER training (avoid GPU sharing). Then judge v8 vs the
+  calibrated bar. Pull artifacts, sign, DELETE BOX (billing!).
+- Deploy-safety guards committed (5 guards, 30 tests) — staged for next robot-day (robot down).

@@ -158,3 +158,39 @@ def test_done_status_is_finished_not_live():
                   [("train-thriller-a1", ITER_LOG)])
     j = monitor.parse_gather(raw)["jobs"][0]
     assert j["live"] is False and j["state"] == "done"
+
+def test_parse_job_log_eta_elapsed_itertime():
+    """ETA / elapsed / per-iteration time are parsed from the rsl_rl runner format."""
+    text = (
+        "Learning iteration 4545/7000\n"
+        "Mean reward: 49.77\n"
+        "Iteration time: 1.08s\n"
+        "Time elapsed: 0:10:03\n"
+        "ETA: 0:44:12\n"
+    )
+    j = monitor.parse_job_log("train-thriller_v5fid", text)
+    assert j["elapsed_s"] == 603          # 10m03s
+    assert j["eta_s"] == 2652             # 44m12s
+    assert j["iteration_time_s"] == 1.08
+    assert j["iteration"] == 4545 and j["max_iteration"] == 7000
+
+
+def test_parse_job_log_eta_fields_default_none():
+    j = monitor.parse_job_log("x", "Mean reward: 1.0\n")
+    assert j["eta_s"] is None and j["elapsed_s"] is None and j["iteration_time_s"] is None
+
+def test_augment_job_plan_total_eta_and_stage():
+    """total_eta_s = remaining iters to the final target × per-iter time + verify seconds;
+    stage derived from stage_boundaries."""
+    plan = {"final_target_iter": 10000, "stage_boundaries": [4000, 7000, 10000], "verify_seconds": 1200}
+    job = {"name": "train-thriller_v5fid", "iteration": 4933, "iteration_time_s": 1.19}
+    monitor.augment_job_plan(job, plan)
+    # remaining 5067 * 1.19 + 1200 = 7229.73 -> 7230
+    assert job["total_eta_s"] == round((10000 - 4933) * 1.19 + 1200)
+    assert job["stage"] == 2 and job["total_stages"] == 3   # 4000 < 4933 <= 7000
+
+
+def test_augment_job_plan_noop_without_plan_or_values():
+    job = {"name": "x", "iteration": None}
+    monitor.augment_job_plan(job, {})
+    assert "total_eta_s" not in job and "stage" not in job

@@ -55,6 +55,71 @@ MOTOR_VEL_LIMIT = 3 * np.pi  # rad/s, G1 motor class limit (advisory)
 # and 7-13% — a glitchy motion trips BOTH margins comfortably.
 MAX_JERK_PEAK = 20000.0      # rad/s^3
 MAX_SPIKE_FRAMES_PCT = 2.0   # % of frames with a robust accel spike
+# SEVERE tier (HARD gate — the "don't pay GPU on garbage" backstop). Set well
+# ABOVE the advisory limits so a cleaned motion (jerk 7.5-14k, <1.3% spikes) and
+# even a marginal one pass, but raw un-de-glitched GVHMR/GMR (37-68k, 7-13%) is
+# BLOCKED before any cloud spend. Same data basis as the advisory thresholds
+# (data/telemetry/motion_quality_20260710).
+SEVERE_JERK_PEAK = 30000.0      # rad/s^3  (between the 20k advisory and 37k raw floor)
+SEVERE_SPIKE_FRAMES_PCT = 5.0   # %        (between 2% advisory and 7% raw floor)
+SEVERE_VEL_OVER_PCT = 70.0      # % frames past the motor limit = grossly infeasible
+
+
+def severe_after_clean(csv_path: str) -> list:
+    """Post-clean HARD backstop (importable): reasons a CLEANED motion is STILL
+    clearly broken — jerk/spike above the severe floor, or grossly infeasible.
+    Empty list = safe to train. This is the 'don't pay GPU on garbage that even
+    de-glitch couldn't fix' gate; verified NOT to trip on the cleaned Thriller
+    (7.6k jerk, 0.1% spike) — only a raw un-cleaned source (63k) trips it."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from pipeline.motion_io import load_motion_csv
+    from tools.motion_quality import analyze as mq_analyze
+    m = load_motion_csv(csv_path)
+    mq = mq_analyze(m, CSV_FPS)
+    spike_pct = 100.0 * mq["spike_frame_count"] / max(len(m), 1)
+    jvel = np.abs(np.diff(m[:, 7:], axis=0) * CSV_FPS)
+    over = float((jvel > MOTOR_VEL_LIMIT).any(axis=1).mean())
+    reasons = []
+    if mq["jerk_peak_rad_s3"] > SEVERE_JERK_PEAK:
+        reasons.append(f"jerk_peak {mq['jerk_peak_rad_s3']:.0f}>{SEVERE_JERK_PEAK:.0f}")
+    if spike_pct > SEVERE_SPIKE_FRAMES_PCT:
+        reasons.append(f"spike {spike_pct:.1f}%>{SEVERE_SPIKE_FRAMES_PCT:.0f}%")
+    if 100 * over > SEVERE_VEL_OVER_PCT:
+        reasons.append(f"vel_over {100*over:.0f}%>{SEVERE_VEL_OVER_PCT:.0f}%")
+    return reasons
+
+
+def kinematic_feasibility(m: np.ndarray, fps: float = CSV_FPS) -> dict:
+    """Per-frame KINEMATIC feasibility vs the TRUE G1 envelope (pipeline.g1_limits,
+    extracted from the training model — NOT the menagerie model this file otherwise
+    loads). Reports position clamp-distance, joint velocity and acceleration vs the
+    per-joint limits. Importable; folded into the vet JSON as `kinematic_feasibility`.
+    (Dynamic torque + balance live in pipeline.motion_dynamics — heavier, mj_inverse.)"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from pipeline import g1_limits as L
+
+    j = m[:, 7:]
+    # position clamp-distance vs the per-joint model ranges
+    if L.POS_LO is not None:
+        clamp = (np.clip(L.POS_LO - j, 0, None) + np.clip(j - L.POS_HI, 0, None))
+    else:
+        clamp = np.zeros_like(j)
+    jvel = np.diff(j, axis=0) * fps                      # (N-1,29)
+    jacc = np.diff(j, axis=0, n=2) * fps * fps           # (N-2,29)
+    vel_over = np.abs(jvel) > L.VELOCITY_LIMIT
+    return {
+        "pos_worst_clamp_rad": round(float(clamp.max()), 4),
+        "pos_frames_over_pct": round(100.0 * float((clamp > 1e-3).any(axis=1).mean()), 2),
+        "vel_peak_rad_s": round(float(np.abs(jvel).max()), 2),
+        "vel_frames_over_limit_pct": round(100.0 * float(vel_over.any(axis=1).mean()), 2),
+        "accel_peak_rad_s2": round(float(np.abs(jacc).max()), 1),
+        "per_joint_vel_limit_rad_s": L.VELOCITY_LIMIT.tolist(),
+        "ok": bool(clamp.max() < 0.05 and not vel_over.any()),
+        "note": "envelope from pipeline.g1_limits (mjlab training model); "
+                "dynamic torque/balance = pipeline.motion_dynamics",
+    }
 
 
 def main():
@@ -172,6 +237,38 @@ def main():
         "input_contact_offset_m": round(float(ground_shift), 4),
         "limit": UNGROUNDED_FLAG_M,
         "ok": abs(ground_shift) <= UNGROUNDED_FLAG_M}
+
+    # ADVISORY 5: severe-quality signal. This gate runs on the RAW pre-clean
+    # motion (prep_motion.clean_motion de-glitches downstream), so it must NOT be
+    # a hard gate here — a raw glitchy source is expected and gets cleaned. It is
+    # surfaced loudly so the operator knows the SOURCE is bad; the actual hard
+    # backstop is applied POST-clean, before GPU spend (see local_motion + the
+    # train stage: severe_after_clean()).
+    severe_reasons = []
+    if mq["jerk_peak_rad_s3"] > SEVERE_JERK_PEAK:
+        severe_reasons.append(f"jerk_peak {mq['jerk_peak_rad_s3']:.0f}>{SEVERE_JERK_PEAK:.0f}")
+    if spike_pct > SEVERE_SPIKE_FRAMES_PCT:
+        severe_reasons.append(f"spike {spike_pct:.1f}%>{SEVERE_SPIKE_FRAMES_PCT:.0f}%")
+    if 100 * over > SEVERE_VEL_OVER_PCT:
+        severe_reasons.append(f"vel_over {100*over:.0f}%>{SEVERE_VEL_OVER_PCT:.0f}%")
+    advisory["severe_quality"] = {
+        "reasons": severe_reasons,
+        "jerk_peak_rad_s3": mq["jerk_peak_rad_s3"],
+        "spike_frames_pct": round(spike_pct, 1),
+        "vel_over_limit_pct": round(100 * over, 1),
+        "note": "raw source severely glitchy — clean stage must tame it before training"
+                if severe_reasons else "ok",
+        "ok": not severe_reasons}
+
+    # ADVISORY 6: kinematic feasibility vs the TRUE G1 envelope (g1_limits). This
+    # is advisory (the RL tracking reward smooths references); the load-bearing
+    # dynamic torque/balance pass is pipeline.motion_dynamics (run separately —
+    # it needs mj_inverse). Never blocks the gate here.
+    try:
+        kf = kinematic_feasibility(m, CSV_FPS)
+        advisory["kinematic_feasibility"] = kf
+    except Exception as e:  # noqa: BLE001 — advisory must never break the gate
+        advisory["kinematic_feasibility"] = {"ok": True, "error": str(e)[:120]}
 
     res["hard"] = hard
     res["advisory"] = advisory
